@@ -1,0 +1,2221 @@
+---
+title: "Predicting Client Subscription to Term Deposit"
+author: "Dikshya Niraula, Keith Sheridan, and Ting Zhang"
+date: "2023-12-13"
+output: pdf_document
+---
+
+```{r}
+library(tidyverse)
+library(fBasics)
+library(skimr) 
+library(gridExtra)
+library(ggmosaic)
+library(caret)
+library(rpart)
+library(pROC)
+#library(tree.bins)
+library(partykit)
+library(ggplot2)
+library(ROSE)
+library(ROCR)
+```
+
+###################################
+  ######### Phase 1 ############
+##################################
+
+### Reading in the dataset ###
+```{r}
+data <- read_delim("train.csv", delim=";", na = c(".", "", "?", "NA"))
+#data <- read_delim("/Users/dikshyaniraula/Downloads/train2.csv", delim=";", na = c(".", "", "?", "NA"))
+data
+##str(data)
+
+##categorical_vars <- c("job", "marital", "education", "default", "housing", "loan", "contact", "month", "poutcome")
+
+##numerical_vars <- c("age", "balance", "day", "duration", "campaign", "pdays", "previous")
+```
+
+### Data Cleaning ###
+```{r}
+any(is.null(data)) # checking missing values
+any(is.na(data))
+
+data<-data %>% 
+  mutate(across(c(default, housing, loan, y), ~dplyr::recode(.,"yes"= 1, "no"=0))) %>% 
+  mutate(across(where(is.character) | c(default, housing, loan, y, day), as.factor)) %>% 
+  rename(is_subscription = y)
+data
+
+min(data$pdays) ##-1, should we create an indicator variable for pdays?
+```
+
+### Check if all -1s in pdays are matched with 0s in previous ###
+```{r}
+length(data$pdays[data$pdays == -1]) # 36954
+length(data$previous[data$previous == 0]) # 36954
+
+matching_rows <- data$pdays == -1 & data$previous == 0
+sum(matching_rows==TRUE) # 36954
+
+## Because we already have this variable previous, creating an indicator variable for pdays seems unnecessary (will be correlated); -1 in pdays will be kept intact
+```
+
+### Exploring Unknown ###
+```{r}
+## contact, job, education, poutcome have 'unknown' as a category
+data %>%
+  group_by(contact)%>%
+  summarise(count = n(),
+            percent = count/nrow(data)*100) ## 28.8% unknown, imputation needed?
+
+data %>%
+  group_by(job)%>%
+  summarise(count = n(),
+            percent = count/nrow(data)*100) ## 0.6% unknown, imputation needed?
+
+data %>%
+  group_by(education)%>%  
+  summarise(count = n(),
+            percent = count/nrow(data)*100) ## 4.1% unknown, imputation needed?
+
+data %>%
+  group_by(poutcome)%>%
+  summarise(count = n(),
+            percent = count/nrow(data)*100) ## 81.748% unknown, imputation needed?
+data %>%
+  group_by(pdays)%>%
+  summarise(count = n(),
+            percent = count/nrow(data)*100) ## 81.737% -1s, match with the unknowns in poutcome?
+```
+
+### Check if all -1s in pdays are matched with unknowns in poutcome ###
+```{r}
+length(data$previous[data$poutcome == "unknown"]) # 36959
+
+matching_rows <- data$pdays == -1 & data$poutcome == "unknown"
+sum(matching_rows==TRUE) # 36954
+
+missing_rows <- data$pdays != -1 & data$poutcome == "unknown"
+sum(missing_rows) # 5
+
+data %>% filter(data$pdays != -1 & data$poutcome == "unknown")
+## 5 values in poutcome are actually missing
+```
+
+
+### Data Exploration ###
+```{r}
+## Distribution of target variable
+ggplot(data) +
+  geom_bar(aes(is_subscription, fill = as.factor(data$is_subscription)), position = 'identity') +
+  scale_fill_manual(values = c("#089BA3", "grey40"),
+                    labels = c("no", "yes")) +
+  theme_minimal() +
+  theme(plot.background = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(title = 'Count of is_subscription', fill="Subscription")+
+  scale_color_discrete(name = "Subscription")
+ 
+## Count of target variable by group
+data %>%
+  group_by(is_subscription) %>%
+  summarise(count = n()) # 0(no): 39922, 1(yes): 5289
+
+## Proportion table of target variable
+round(prop.table(table(data$is_subscription))*100,1) # 0(no): 88.3%, 1(yes): 11.7, imbalance?
+
+## Summary statistics for numeric variables ##
+data %>% select_if(is.numeric) %>%  basicStats 
+
+## Summary statistics by Target variable ##
+data %>% group_by(is_subscription) %>% skim
+```
+
+### Graphs ###
+```{r}
+## Plot numerical variables without target:
+np1 <- ggplot(data, aes(age)) + geom_histogram(bins=100) + ggtitle("Distribution of age")
+np2 <- ggplot(data, aes(balance)) + geom_histogram(bins=100) + ggtitle("Distribution of balance")
+np3 <- ggplot(data, aes(duration)) + geom_histogram(bins=100) + ggtitle("Distribution of duration")
+np4 <- ggplot(data, aes(campaign)) + geom_histogram(bins=100) + ggtitle("Distribution of campaign")
+np5 <- ggplot(data, aes(pdays)) + geom_histogram(bins=100) + ggtitle("Distribution of pdays")
+np6 <- ggplot(data, aes(previous)) + geom_histogram(bins=100) + ggtitle("Distribution of previous")
+
+grid.arrange(np1, np2, np3, ncol=2, nrow =2)
+grid.arrange(np4, np5, np6, ncol=2, nrow =2)
+```
+
+```{r}
+##Reorder categorical variables based on their frequencies
+job_order<- reorder(data$job, data$job, function(x) -length(x))
+marital_order<- reorder(data$marital, data$marital, function(x) -length(x))
+education_order<- reorder(data$education, data$education, function(x) -length(x))
+default_order<- reorder(data$default, data$default, function(x) -length(x))
+housing_order<- reorder(data$housing, data$housing, function(x) -length(x))
+loan_order<- reorder(data$loan, data$loan, function(x) -length(x))
+contact_order<- reorder(data$contact, data$contact, function(x) -length(x))
+month_order<- reorder(data$month, data$month, function(x) -length(x))
+poutcome_order<- reorder(data$poutcome, data$poutcome, function(x) -length(x))
+day_order<- reorder(data$day, data$day, function(x) -length(x))
+
+## Plot categorical variables without target:
+cp1 <- ggplot(data, aes(job_order)) + 
+  geom_bar() +
+  xlab("job") +
+  geom_text(aes(label = after_stat(count)), stat = "count", vjust = 1.5, colour = "green")+
+  scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+  ggtitle("Distribution of job")
+cp2 <- ggplot(data, aes(marital_order)) + 
+  geom_bar() +
+  xlab("marital status") +
+  geom_text(aes(label = after_stat(count)), stat = "count", vjust = 1.5, colour = "green") +
+  ggtitle("Distribution of marital status")
+cp3 <- ggplot(data, aes(education_order)) + 
+  geom_bar() +
+  xlab("education") +
+  geom_text(aes(label = after_stat(count)), stat = "count", vjust = 1.5, colour = "green") +
+  ggtitle("Distribution of education")
+cp4 <- ggplot(data, aes(default_order)) + 
+  geom_bar() +
+  xlab("default") +
+  geom_text(aes(label = after_stat(count)), stat = "count", vjust = 1.5, colour = "green") +
+  ggtitle("Distribution of default")
+cp5 <- ggplot(data, aes(housing_order)) + 
+  geom_bar() +
+  xlab("housing") +
+  geom_text(aes(label = after_stat(count)), stat = "count", vjust = 1.5, colour = "green") +
+  ggtitle("Distribution of housing")
+cp6 <- ggplot(data, aes(loan_order)) + 
+  geom_bar() +
+  xlab("loan") +
+  geom_text(aes(label = after_stat(count)), stat = "count", vjust = 1.5, colour = "green") +
+  ggtitle("Distribution of loan")
+cp7 <- ggplot(data, aes(contact_order)) + 
+  geom_bar() +
+  xlab("contact") +
+  geom_text(aes(label = after_stat(count)), stat = "count", vjust = 1.5, colour = "green") +
+  ggtitle("Distribution of contact")
+cp8 <- ggplot(data, aes(month_order)) + 
+  geom_bar() +
+  xlab("month") +
+  geom_text(aes(label = after_stat(count)), stat = "count", vjust = 1.5, colour = "green") +
+  ggtitle("Distribution of month")
+cp9 <- ggplot(data, aes(poutcome_order)) + 
+  geom_bar() +
+  xlab("poutcome") +
+  geom_text(aes(label = after_stat(count)), stat = "count", vjust = 1.5, colour = "green") +
+  scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+  ggtitle("Distribution of poutcome")
+cp10 <- ggplot(data, aes(day_order)) + 
+  geom_bar() +
+  xlab("day") +
+  geom_text(aes(label = after_stat(count)), stat = "count", vjust = 0.5, angle=90, 
+            colour = "green")+
+  ggtitle("Distribution of day")
+
+grid.arrange(cp2, cp7, cp5, ncol=3, nrow =1)
+grid.arrange(cp6, cp4, ncol=2, nrow =1)
+grid.arrange(cp9, cp3, ncol=2, nrow =1)
+cp1
+cp8
+cp10
+```
+
+```{r}
+## Plot side by side box plots of numerical data with target:
+np_t1 <- ggplot(data, aes(x=is_subscription, y=age, fill=is_subscription)) +
+  geom_boxplot(notch=TRUE) +
+  ggtitle("Relationship between age and is_subscription")
+np_t2 <- ggplot(data, aes(x=is_subscription, y=balance, fill=is_subscription)) +
+  geom_boxplot(notch=TRUE) +
+  ggtitle("Relationship between balance and is_subscription")
+np_t3 <- ggplot(data, aes(x=is_subscription, y=duration, fill=is_subscription)) +
+  geom_boxplot(notch=TRUE) +
+  ggtitle("Relationship between duration and is_subscription")
+np_t4 <- ggplot(data, aes(x=is_subscription, y=campaign, fill=is_subscription)) +
+  geom_boxplot(notch=TRUE) +
+  ggtitle("Relationship between campaign and is_subscription")
+np_t5 <- ggplot(data, aes(x=is_subscription, y=pdays, fill=is_subscription)) +
+  geom_boxplot(notch=TRUE) +
+  ggtitle("Relationship between pdays and is_subscription")
+np_t6 <- ggplot(data, aes(x=is_subscription, y=previous, fill=is_subscription)) +
+  geom_boxplot(notch=TRUE) +
+  ggtitle("Relationship between previous and is_subscription")
+
+grid.arrange(np_t1, np_t2, ncol=1, nrow =2)
+grid.arrange(np_t6, np_t3, ncol=1, nrow =2)
+grid.arrange(np_t4, np_t5, ncol=1, nrow =2)
+```
+
+```{r}
+## Plot mosaic plots of categorical data with target:
+cp_t1 <- ggplot(data) +
+  geom_mosaic(aes(x=product(job_order), fill=is_subscription))+
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Relationship between job and is_subscription")
+cp_t2 <- ggplot(data) +
+  geom_mosaic(aes(x=product(marital_order), fill=is_subscription)) +
+  ggtitle("Relationship between marital status and is_subscription")
+cp_t3 <- ggplot(data) +
+  geom_mosaic(aes(x=product(education_order), fill=is_subscription))+
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Relationship between education and is_subscription")
+cp_t4 <- ggplot(data) +
+  geom_mosaic(aes(x=product(default_order), fill=is_subscription)) +
+  ggtitle("Relationship between default and is_subscription")
+cp_t5 <- ggplot(data) +
+  geom_mosaic(aes(x=product(housing_order), fill=is_subscription)) +
+  ggtitle("Relationship between housing and is_subscription")
+cp_t6 <- ggplot(data) +
+  geom_mosaic(aes(x=product(loan_order), fill=is_subscription)) +
+  ggtitle("Relationship between loan and is_subscription")
+cp_t7 <- ggplot(data) +
+  geom_mosaic(aes(x=product(contact_order), fill=is_subscription)) +
+  ggtitle("Relationship between contact and is_subscription")
+cp_t8 <- ggplot(data) +
+  geom_mosaic(aes(x=product(month_order), fill=is_subscription))+
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Relationship between month and is_subscription")
+cp_t9 <- ggplot(data) +
+  geom_mosaic(aes(x=product(poutcome_order), fill=is_subscription))+
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Relationship between poutcome and is_subscription")
+cp_t9 <- ggplot(data) +
+  geom_mosaic(aes(x=product(day_order), fill=is_subscription))+
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Relationship between day and is_subscription")
+
+grid.arrange(cp_t2, cp_t7, cp_t5, ncol=1, nrow =3)
+grid.arrange(cp_t6, cp_t4, ncol=1, nrow =2)
+grid.arrange(cp_t9, cp_t3, ncol=1, nrow =2)
+cp_t1
+cp_t8
+```
+
+### Variable Importance Measure ###
+```{r}
+## nominal input - chi-square
+data %>% 
+  summarise(across(where(is.factor) & !is_subscription,
+                   ~ chisq.test(.,is_subscription)$p.value)) %>% 
+  unlist %>% 
+  sort
+
+## numeric input - t stat
+data %>% 
+  summarise(across(where(is.numeric), ~ t.test(.~is_subscription)$p.value)) %>%
+  unlist %>% 
+  sort
+
+## numeric input - area under ROC curve for predicting target
+data %>% 
+  select(is_subscription, where(is.numeric)) %>%  
+  filterVarImp(.$is_subscription) %>%  
+  slice(-1) %>%
+  arrange(desc(X1)) 
+```
+
+### Replace missing unknowns with NAs ###
+```{r}
+## All unknowns of job, education, and contact; 5 unknowns of poutcome are replaced 
+data.na <- data
+data.na$poutcome <- as.character(data.na$poutcome)
+
+data.na <- data.na %>% mutate(job = replace(job, job == "unknown", NA),
+                              education = replace(education, education == "unknown", NA),
+                              contact = replace(contact, contact == "unknown", NA),
+                              poutcome = ifelse(pdays != -1 & poutcome == "unknown", NA,
+                                                poutcome))
+
+data.na$poutcome <- as.factor(data.na$poutcome)
+data.na
+
+## Check if the true unknowns in poutcome were correctly replaced
+sum(is.na(data.na$poutcome))
+data.na %>% filter(is.na(poutcome)) 
+
+## Check missing value proportions 
+missprop <- data.na %>% summarise(across(everything(), ~ sum(is.na(.))/length(.)))
+print(missprop, width = Inf)
+
+## Get the names of variables with missing values 
+vars.na <- data.na %>% select_if(colSums(is.na(.))>0) %>% names 
+vars.na 
+```
+
+### Partitioning ###
+```{r}
+library(caTools)
+set.seed(1234)
+split = sample.split(data.na$is_subscription, SplitRatio = 0.5) 
+
+library(skimr) 
+data.na %>% filter(split) %>% skim
+data.na %>% filter(!split) %>% skim
+```
+
+### Variable Transformation ###
+```{r}
+data.xf <- data.na
+
+## Box-Cox Transformation 
+TransformParams <- data.xf %>%
+  as.data.frame() %>% 
+  select(-17) %>% 
+  preProcess(method = c("BoxCox"))
+TransformParams$bc # age, day and campaign
+
+data.xf <- data.xf %>% 
+  as.data.frame %>% 
+  predict(TransformParams, .) %>% 
+  as_tibble
+
+## Histogram before/after Box-Cox Transformation
+par(mfrow=c(3,2))
+hist(data.na$age)
+hist(data.xf$age)
+hist(data.na$campaign)
+hist(data.xf$campaign)
+```
+
+```{r}
+## YeoJohnson Transformation
+data.xf <- data.na
+
+TransformParams2 <- data.xf %>%
+  as.data.frame() %>% 
+  select(-17) %>% 
+  preProcess(method = c("YeoJohnson"))
+TransformParams2$yj # age, day and campaign
+
+data.xf <- data.xf %>% 
+  as.data.frame %>% 
+  predict(TransformParams2, .) %>% 
+  as_tibble
+
+## Histogram before/after YeoJohnson Transformation 
+par(mfrow=c(3,2))
+hist(data.na$age)
+hist(data.xf$age)
+hist(data.na$balance)
+hist(data.xf$balance)
+hist(data.na$duration)
+hist(data.xf$duration)
+hist(data.na$campaign)
+hist(data.xf$campaign)
+hist(data.na$pdays)
+hist(data.xf$pdays)
+```
+
+```{r}
+## Stats before/after transformation
+library(fBasics)
+
+data.na %>% select(age, balance, duration, campaign, pdays) %>% skewness
+data.xf %>% select(age, balance, duration, campaign, pdays) %>% skewness 
+
+data.na %>% select(age, balance, duration, campaign, pdays) %>% kurtosis
+data.xf %>% select(age, balance, duration, campaign, pdays) %>% kurtosis
+```
+
+### Variable Imputation ###
+```{r}
+data.imp <- data.xf
+
+## Impute nominal inputs by mode 
+mode <- function(x) {
+  ux <- na.omit(unique(x))
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+data.imp <- data.imp %>% 
+  mutate(across(where(is.factor), ~replace_na(.,mode(.[split]))))  
+
+## Create Missing Value Flags
+data.imp[paste(vars.na, "NA", sep=".")] <- ifelse(is.na(data.na[vars.na]), 1, 0) 
+
+data.imp <- data.imp %>% mutate(across(ends_with(".NA"), as.factor))
+
+data.imp
+sum(is.na(data.imp))
+```
+
+### Logistic Regression ###
+```{r}
+data.mdl <- data.imp 
+levels(data.mdl$is_subscription) # check primary outcome; glm function uses 2nd factor level as primary
+
+# Build full model
+full <- glm(is_subscription ~ ., family=binomial, data=data.mdl[split,])
+
+
+# Set up null model
+null <- glm(is_subscription ~ 1, family=binomial, data=data.mdl[split,])
+n <- sum(split)
+```
+
+```{r}
+## Stepwise selection using alternative cutoff
+reg.step <- step(null, scope=formula(full), direction="both", k=log(n))
+
+summary(reg.step) ## duration, poutcome, month, contact.NA, housing, campaign, loan, marital, education, balance
+
+reg.step.prob <- predict(reg.step, data.mdl[!split,], type="response")
+
+## Use alternative cutoff
+rocCurve.reg <- roc(data.na$is_subscription[!split], reg.step.prob, quiet = TRUE)
+regThresh <-  coords(rocCurve.reg, x = "best", best.method = "closest.topleft")
+reg.class <- as.factor(ifelse(reg.step.prob >= regThresh$threshold, 1,0))
+reg.step.fscore <-confusionMatrix(reg.class, data.na$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+
+reg.step.fscore ## 0.5267671  
+
+confusionMatrix(reg.class,data.na$is_subscription[!split],
+                positive = "1", mode = "everything")
+```
+
+```{r}
+## Forward selection
+reg.fwd <- step(null, scope=formula(full), direction = "forward", k=log(n), trace=FALSE)
+
+summary(reg.fwd) ## duration, poutcome, month, contact.NA, housing, campaign, loan, marital, education, balance
+
+reg.fwd.prob <- predict(reg.fwd, data.mdl[!split,], type="response")
+
+## Use alternative cutoff
+rocCurve.reg <- roc(data.na$is_subscription[!split], reg.fwd.prob, quiet = TRUE)
+regThresh <-  coords(rocCurve.reg, x = "best", best.method = "closest.topleft")
+reg.class <- as.factor(ifelse(reg.fwd.prob >= regThresh$threshold, 1,0))
+reg.fwd.fscore <-confusionMatrix(reg.class, data.na$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+
+reg.fwd.fscore ## 0.5267671
+
+confusionMatrix(reg.class,data.na$is_subscription[!split],
+                positive = "1", mode= "everything")
+```
+
+```{r}
+## Backward elimination
+reg.bwd <- step(full, direction = "backward", k=log(n), trace=FALSE)
+
+summary(reg.bwd) ## marital, education, balance, housing, loan, month, duration, campaign, poutcome, contact.NA
+
+reg.bwd.prob <- predict(reg.bwd, data.mdl[!split,], type="response")
+
+## Use alternative cutoff
+rocCurve.reg <- roc(data.na$is_subscription[!split], reg.bwd.prob, quiet = TRUE)
+regThresh <-  coords(rocCurve.reg, x = "best", best.method = "closest.topleft")
+reg.class <- as.factor(ifelse(reg.bwd.prob >= regThresh$threshold, 1,0))
+reg.bwd.fscore <-confusionMatrix(reg.class, data.na$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+
+reg.bwd.fscore ## 0.5267671 
+
+confusionMatrix(reg.class,data.na$is_subscription[!split],
+                positive = "1", mode= "everything")
+```
+
+```{r}
+c(reg.step.fscore, reg.fwd.fscore, reg.bwd.fscore) # all same, something wrong?
+
+## odds ratio estimate 
+exp(coef(reg.step))
+```
+
+### Variable Importance ###
+```{r}
+varImp(reg.step) # absolute value of z stat
+varImp(reg.step) %>% arrange(desc(Overall))
+```
+
+###################################
+  ######### Phase 2 ############
+##################################
+
+## Decision Tree for Consolidating day ##
+```{r}
+## Use profit-driven tree since we have a class imbalance
+
+## Model building (only using day as input)
+prop<-1/prop.table(table(data.na$is_subscription)) ##use untransformed data 
+
+## Define cost matrix
+costMatrix <-matrix(c(0,prop[2],prop[1],0), nrow=2) 
+costMatrix
+
+##tree <- rpart(formula = is_subscription ~ day,data = data.na[split,],
+            ##parms=list(loss=costMatrix),
+            ##control=rpart.control(cp=0.001)) ## only gives 2 leaves
+##summary(tree) 
+
+tree <- rpart(formula = is_subscription ~ day,data = data.na[split,],
+              parms=list(loss=costMatrix),
+              control=rpart.control(cp=0.0001)) ## deeper tree with 5 leaves
+summary(tree)
+
+## Model visualization
+plot(as.party(tree))
+
+## Print Tree
+print(tree)
+```
+
+```{r}
+## Model pruning on F-score
+cp.seq=tree$cptable[,1]
+fscore<-numeric(0)
+fscore[1]<-0
+for (i in 2:length(cp.seq)) {
+  tree.prob <- predict(prune(tree, cp=cp.seq[i]), data.na[!split,], type="prob")[,2] 
+  rocCurve.tree <- roc(data.na$is_subscription[!split], tree.prob, quiet=TRUE)
+  treeThresh <- coords(rocCurve.tree, x = "best", best.method = "closest.topleft")
+  tree.class <- as.factor(ifelse(tree.prob >= treeThresh$threshold, 1, 0))
+  fscore[i]<- confusionMatrix(tree.class, data.na$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+}
+
+
+plot(tree$cptable[,'nsplit']+1, fscore,
+     type="o", xlab="Number of Leaves", ylab="F-score")
+
+
+## Final model
+tree.final=prune(tree, cp=cp.seq[fscore==max(fscore)])  
+summary(tree.final) 
+
+## Maximum F-Score
+max(fscore) # 0.2369344
+
+## Final Model visualization
+plot(as.party(tree.final))
+
+## Print Final Tree
+print(tree.final) ##same as the tree without pruning
+
+  
+## Leaves: Group1= 7,19,20,28,29,31 ; Group2= 5,6,9,17,21 ; Group3= 8,14,18,26 ; Group4= 11,23,27 ;
+## Group5= 1,2,3,4,10,12,13,15,16,22,24,25,30
+```
+
+### Condensing the Levels of day ###
+```{r}
+data.final <- data.na
+data.final$day <- as.numeric(data.final$day) ## easier to replace with numeric
+
+Group.1 <- c(7,19,20,28,29,31)
+Group.2 <- c(5,6,9,17,21)
+Group.3 <- c(8,14,18,26)
+Group.4 <- c(11,23,27)
+Group.5 <- c(1,2,3,4,10,12,13,15,16,22,24,25,30)
+
+data.final <- data.final %>% mutate(day = replace(day, day %in% Group.1, "Group1"),
+                                    day = replace(day, day %in% Group.2, "Group2"),
+                                    day = replace(day, day %in% Group.3, "Group3"),
+                                    day = replace(day, day %in% Group.4, "Group4"),
+                                    day = replace(day, day %in% Group.5, "Group5"))
+                               
+data.final$day <- as.factor(data.final$day) ## factor the day variable again
+
+levels(data.final$day) ## reconfirm the levels of day 
+
+data.final
+```
+####################################################################
+  ######### Repeat everything for the final data set ############
+###################################################################
+
+### Data partitioning, transformation and imputation will give same results as Phase 1 ###
+
+### Partitioning ###
+```{r}
+library(caTools)
+set.seed(1234)
+split = sample.split(data.final$is_subscription, SplitRatio = 0.5) 
+
+library(skimr) 
+data.final %>% filter(split) %>% skim
+data.final %>% filter(!split) %>% skim
+```
+
+### Profit-Driven Decision Tree ###
+```{r}
+## Model building 
+prop<-1/prop.table(table(data.final$is_subscription))  
+
+## Define cost matrix
+costMatrix <-matrix(c(0,prop[2],prop[1],0), nrow=2) 
+costMatrix
+
+tree <- rpart(formula = is_subscription ~ .,data = data.final[split,],
+              parms=list(loss=costMatrix),
+              control=rpart.control(cp=0.001)) 
+summary(tree) 
+
+## Model pruning on F-score
+cp.seq=tree$cptable[,1]
+fscore<-numeric(0)
+fscore[1]<-0
+for (i in 2:length(cp.seq)) {
+  tree.prob <- predict(prune(tree, cp=cp.seq[i]), data.final[!split,],type="prob")[,2] 
+  rocCurve.tree <- roc(data.final$is_subscription[!split], tree.prob, quiet=TRUE)
+  treeThresh <- coords(rocCurve.tree, x = "best", best.method = "closest.topleft")
+  tree.class <- as.factor(ifelse(tree.prob >= treeThresh$threshold, 1,0))
+  fscore[i]<- confusionMatrix(tree.class, data.final$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+}
+
+
+plot(tree$cptable[,'nsplit']+1, fscore,
+     type="o", xlab="Number of Leaves", ylab="F-score")
+
+
+## Final model
+tree.final=prune(tree, cp=cp.seq[fscore==max(fscore)])  
+summary(tree.final) ## duration, month, poutcome, housing, age, pdays, job, previous, day, balance 
+
+## Maximum F-Score
+max(fscore)  ## 0.5361282 
+
+## Final Model visualization
+plot(as.party(tree.final)) ## 19 leaves
+
+confusionMatrix(tree.class, data.final$is_subscription[!split],
+               positive = "1", mode= "everything")
+
+## Note: cp=0.005 has 11 leaves and a lower F-score of 0.4926363
+```
+
+### heatmap of DT on imbalanced data 
+
+```{r}
+# The code provided generates a visual representation of the confusion matrix using a heatmap with proportional fill and alpha values.
+library(caret)
+
+# Creating a data frame with the confusion matrix table
+table.DT <- data.frame(confusionMatrix(tree.class, data.final$is_subscription[!split],
+                        positive = "1", mode = "everything")$table)
+
+# Creating a plotTable with additional columns for 'goodbad' and 'prop'
+plotTable.DT <- table.DT %>%
+  mutate(goodbad = ifelse(table.DT$Prediction == table.DT$Reference, "good", "bad")) %>%
+  group_by(Reference) %>%
+  mutate(prop = Freq/sum(Freq))
+
+# Generating the heatmap plot
+ggplot(data = plotTable.DT, mapping = aes(x = Reference, y = Prediction, fill = goodbad, alpha = prop)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = .5, fontface  = "bold", alpha = 1,size = 30) +
+  scale_fill_manual(values = c(good = "forestgreen", bad = "firebrick1")) +
+  theme_bw() +
+  xlim(rev(levels(table.DT$Reference))) +
+  theme(text = element_text(size=30)) +
+  xlab("True Value")
+
+```
+
+### Variable Transformation ###
+```{r}
+data.xf <- data.final
+
+## Only Consider YeoJohnson Transformation 
+TransformParams2 <- data.xf %>%
+  as.data.frame() %>% 
+  select(-17) %>% 
+  preProcess(method = c("YeoJohnson"))
+TransformParams2$yj # age, day and campaign
+
+data.xf <- data.xf %>% 
+  as.data.frame %>% 
+  predict(TransformParams2, .) %>% 
+  as_tibble
+
+## Histogram before/after YeoJohnson Transformation 
+par(mfrow=c(3,2))
+hist(data.final$age)
+hist(data.xf$age)
+hist(data.final$balance)
+hist(data.xf$balance)
+hist(data.final$duration)
+hist(data.xf$duration)
+hist(data.final$campaign)
+hist(data.xf$campaign)
+hist(data.final$pdays)
+hist(data.xf$pdays)
+```
+
+```{r}
+## Stats before/after transformation
+library(fBasics)
+
+data.final %>% select(age, balance, duration, campaign, pdays) %>% skewness
+data.xf %>% select(age, balance, duration, campaign, pdays) %>% skewness 
+
+data.final %>% select(age, balance, duration, campaign, pdays) %>% kurtosis
+data.xf %>% select(age, balance, duration, campaign, pdays) %>% kurtosis
+```
+
+### Variable Imputation ###
+```{r}
+data.imp <- data.xf
+
+## Impute nominal inputs by mode 
+mode <- function(x) {
+  ux <- na.omit(unique(x))
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+data.imp <- data.imp %>% 
+  mutate(across(where(is.factor), ~replace_na(.,mode(.[split]))))  
+
+## Create Missing Value Flags
+data.imp[paste(vars.na, "NA", sep=".")] <- ifelse(is.na(data.final[vars.na]), 1, 0) 
+
+data.imp <- data.imp %>% mutate(across(ends_with(".NA"), as.factor))
+
+data.imp
+sum(is.na(data.imp))
+```
+
+### Logistic Regression ###
+```{r}
+data.mdl <- data.imp 
+levels(data.mdl$is_subscription) ## check primary outcome; glm function uses 2nd factor level as primary
+
+## Build full model
+full <- glm(is_subscription ~ ., family=binomial, data=data.mdl[split,])
+
+## Set up null model
+null <- glm(is_subscription ~ 1, family=binomial, data=data.mdl[split,])
+n <- sum(split)
+```
+
+## Stepwise selection using alternative cutoff
+```{r}
+reg.step <- step(null, scope=formula(full), direction="both", k=log(n))
+
+summary(reg.step) ## duration, poutcome, month, contact.NA, housing, campaign, day, loan, marital, education, balance
+
+reg.step.prob <- predict(reg.step, data.mdl[!split,], type="response")
+
+## Use alternative cutoff
+rocCurve.reg <- roc(data.final$is_subscription[!split], reg.step.prob, quiet = TRUE)
+regThresh <-  coords(rocCurve.reg, x = "best", best.method = "closest.topleft")
+reg.class <- as.factor(ifelse(reg.step.prob >= regThresh$threshold, 1,0))
+reg.step.fscore <-confusionMatrix(reg.class, data.final$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+
+reg.step.fscore ## 0.5334116 ; increased slightly than the previous regression model but less than the decision tree
+
+confusionMatrix(reg.class,data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+```
+## Forward selection
+```{r}
+reg.fwd <- step(null, scope=formula(full), direction = "forward", k=log(n), trace=FALSE)
+
+summary(reg.fwd) ## duration, poutcome, month, contact.NA, housing, campaign, day, loan, marital, education, balance
+
+reg.fwd.prob <- predict(reg.fwd, data.mdl[!split,], type="response")
+
+## Use alternative cutoff
+rocCurve.reg <- roc(data.final$is_subscription[!split], reg.fwd.prob, quiet = TRUE)
+regThresh <-  coords(rocCurve.reg, x = "best", best.method = "closest.topleft")
+reg.class <- as.factor(ifelse(reg.fwd.prob >= regThresh$threshold, 1,0))
+reg.fwd.fscore <-confusionMatrix(reg.class, data.final$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+
+reg.fwd.fscore ## 0.5334116 
+
+confusionMatrix(reg.class,data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+```
+
+## Backward elimination
+```{r}
+reg.bwd <- step(full, direction = "backward", k=log(n), trace=FALSE)
+
+summary(reg.bwd) ## marital, education, balance, housing, loan, day, month, duration, campaign, poutcome, contact.NA 
+
+reg.bwd.prob <- predict(reg.bwd, data.mdl[!split,], type="response")
+
+## Use alternative cutoff
+rocCurve.reg <- roc(data.final$is_subscription[!split], reg.bwd.prob, quiet = TRUE)
+regThresh <-  coords(rocCurve.reg, x = "best", best.method = "closest.topleft")
+reg.class <- as.factor(ifelse(reg.bwd.prob >= regThresh$threshold, 1,0))
+reg.bwd.fscore <-confusionMatrix(reg.class, data.final$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+
+reg.bwd.fscore ## 0.5334
+confusionMatrix(reg.class,data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+```
+
+```{r}
+c(reg.step.fscore, reg.fwd.fscore, reg.bwd.fscore) 
+
+## odds ratio estimate 
+exp(coef(reg.bwd))
+```
+
+### heatmap of Logistic regression on imbalanced data 
+
+```{r}
+
+table.reg <- data.frame(confusionMatrix(reg.class, data.final$is_subscription[!split],
+                        positive = "1", mode = "everything")$table)
+
+plotTable.reg <- table.reg %>%
+  mutate(goodbad = ifelse(table.reg$Prediction == table.reg$Reference, "good", "bad")) %>%
+  group_by(Reference) %>%
+  mutate(prop = Freq/sum(Freq))
+
+# Generating the heatmap plot
+ggplot(data = plotTable.reg, mapping = aes(x = Reference, y = Prediction, fill = goodbad, alpha = prop)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = .5, fontface  = "bold", alpha = 1,size = 30) +
+  scale_fill_manual(values = c(good = "forestgreen", bad = "firebrick1")) +
+  theme_bw() +
+  xlim(rev(levels(table.reg$Reference))) +
+  theme(text = element_text(size=30)) +
+  xlab("True Value")
+
+```
+
+### Variable Importance ###
+```{r}
+varImp(reg.bwd) # absolute value of z stat
+varImp(reg.bwd) %>% arrange(desc(Overall))
+
+varImp(reg.step) # absolute value of z stat
+varImp(reg.step) %>% arrange(desc(Overall))
+
+```
+
+
+### ANN Preparation using input from decision tree ###
+```{r}
+data.ann.DT <- data.imp
+
+vars.ann.DT <- attr(terms(tree.final), "term.labels") # extract variable names from decision tree
+
+## Standardization: numeric inputs ## 
+ScaleParams.DT <- preProcess(data.ann.DT[split, vars.ann.DT], method=c("center", "scale"))
+data.ann.DT <- data.ann.DT %>% predict(ScaleParams.DT, .)
+
+
+## Dummy Encoding: nominal inputs ##
+dummy.DT <- dummyVars( ~ . , data = data.ann.DT[split, c(vars.ann.DT, "is_subscription")], fullRank = TRUE)
+data.ann.encode.DT <- data.ann.DT %>% predict(dummy.DT, .)
+ncol(data.ann.encode.DT)
+
+## Prepare train/validation sets as matrices ##
+x.train.DT <- data.ann.encode.DT[split, -ncol(data.ann.encode.DT)] 
+y.train.DT <- data.ann.encode.DT[split,"is_subscription.1"]
+x.valid.DT <- data.ann.encode.DT[!split, -ncol(data.ann.encode.DT)] 
+y.valid.DT <- data.ann.encode.DT[!split,"is_subscription.1"]
+```
+
+
+### ANN Building ###
+```{r}
+library(tensorflow)
+library(keras)
+
+set_random_seed(1234)
+ann.DT <- keras_model_sequential() %>% 
+  layer_dense(units = 6, activation = "tanh", input_shape = c(45)) %>%  # update input shape
+  layer_dense(units = 1, activation = "sigmoid")
+
+ann.DT %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = "adam",
+  metrics = "accuracy"
+)
+
+callbacks.list = list(
+  callback_early_stopping(
+    monitor = "val_loss", # change
+    patience = 5
+  ),
+  callback_model_checkpoint(
+    filepath="my_ann_raw.h5.DT",
+    monitor = "val_loss",  # change
+    save_best_only = TRUE
+  )
+)
+
+history <- ann.DT %>% fit(
+  x= x.train.DT,
+  y= y.train.DT,
+  epochs = 40,
+  validation_data = list(x.valid.DT, y.valid.DT),
+  verbose = 1,
+  callbacks = callbacks.list)
+
+ann.select.DT <- load_model_hdf5("my_ann_raw.h5.DT") 
+
+## Prediction 
+ann.prob.DT <- ann.select.DT %>% predict(x.valid.DT) 
+
+## Use alternative cutoff
+rocCurve.ann.DT <- roc(data.final$is_subscription[!split], as.vector(ann.prob.DT), quiet=TRUE)
+annThresh.DT <-  coords(rocCurve.ann.DT, x = "best", best.method = "closest.topleft")
+ann.class.DT <- as.factor(ifelse(ann.prob.DT >= annThresh.DT$threshold, 1, 0))
+ann.fscore.DT <- confusionMatrix(ann.class.DT, data.final$is_subscription[!split],
+                            positive = "1")$byClass["F1"]
+
+ann.fscore.DT  ## 0.5449275
+
+confusionMatrix(ann.class.DT, data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+```
+
+
+### ANN Preparation using input from logistic regression ###
+```{r}
+data.ann.lr <- data.imp
+
+vars.ann.lr <- attr(terms(reg.step), "term.labels") # extract variable names from reg
+
+## Standardization: numeric inputs ## 
+ScaleParams.lr <- preProcess(data.ann.lr[split, vars.ann.lr], method=c("center", "scale"))
+data.ann.lr <- data.ann.lr %>% predict(ScaleParams.lr, .)
+
+
+## Dummy Encoding: nominal inputs ##
+dummy.lr <- dummyVars( ~ . , data = data.ann.lr[split, c(vars.ann.lr, "is_subscription")], fullRank = TRUE)
+data.ann.encode.lr <- data.ann.lr %>% predict(dummy.lr, .)
+ncol(data.ann.encode.lr)
+
+## Prepare train/validation sets as matrices ##
+x.train.lr <- data.ann.encode.lr[split, -ncol(data.ann.encode.lr)] 
+y.train.lr <- data.ann.encode.lr[split,"is_subscription.1"]
+x.valid.lr <- data.ann.encode.lr[!split, -ncol(data.ann.encode.lr)] 
+y.valid.lr <- data.ann.encode.lr[!split,"is_subscription.1"]
+```
+
+
+### ANN Building ###
+```{r}
+set_random_seed(1234)
+ann.lr <- keras_model_sequential() %>% 
+  layer_dense(units = 6, activation = "tanh", input_shape = c(29)) %>% 
+  layer_dense(units = 1, activation = "sigmoid")
+
+ann.lr %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = "adam",
+  metrics = "accuracy"
+)
+
+callbacks.list = list(
+  callback_early_stopping(
+    monitor = "val_loss", # change
+    patience = 5
+  ),
+  callback_model_checkpoint(
+    filepath="my_ann_raw.h5.lr",
+    monitor = "val_loss",  # change
+    save_best_only = TRUE
+  )
+)
+
+history <- ann.lr %>% fit(
+  x= x.train.lr,
+  y= y.train.lr,
+  epochs = 40,
+  validation_data = list(x.valid.lr,y.valid.lr),
+  verbose = 1,
+  callbacks = callbacks.list)
+
+ann.select.lr <-load_model_hdf5("my_ann_raw.h5.lr") 
+
+## Prediction 
+ann.prob.lr <- ann.select.lr %>% predict(x.valid.lr) 
+
+## Use alternative cutoff
+rocCurve.ann.lr <- roc(data.final$is_subscription[!split], as.vector(ann.prob.lr), quiet=TRUE)
+annThresh.lr <-  coords(rocCurve.ann.lr, x = "best", best.method = "closest.topleft")
+ann.class.lr <- as.factor(ifelse(ann.prob.lr >= annThresh.lr$threshold, 1, 0))
+ann.fscore.lr <- confusionMatrix(ann.class.lr, data.final$is_subscription[!split],
+                            positive = "1")$byClass["F1"]
+
+ann.fscore.lr  ## 0.577933 
+
+confusionMatrix(ann.class.lr, data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+```
+
+### heatmap of ANN (using input from LR) on imbalanced data 
+
+```{r}
+
+table.ann <- data.frame(confusionMatrix(ann.class.lr, data.final$is_subscription[!split],
+                        positive = "1", mode = "everything")$table)
+
+plotTable.ann <- table.ann %>%
+  mutate(goodbad = ifelse(table.ann$Prediction == table.ann$Reference, "good", "bad")) %>%
+  group_by(Reference) %>%
+  mutate(prop = Freq/sum(Freq))
+
+# Generating the heatmap plot
+ggplot(data = plotTable.ann, mapping = aes(x = Reference, y = Prediction, fill = goodbad, alpha = prop)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = .5, fontface  = "bold", alpha = 1,size = 30) +
+  scale_fill_manual(values = c(good = "forestgreen", bad = "firebrick1")) +
+  theme_bw() +
+  xlim(rev(levels(table.ann$Reference))) +
+  theme(text = element_text(size=30)) +
+  xlab("True Value")
+
+```
+
+### ANN Preparation using combined inputs from decision tree and logistic regression ###
+```{r}
+data.ann.comb <- data.imp
+
+## 15 inputs: marital, education, balance, housing, loan, day, month, duration, campaign, poutcome, contact.NA, age, pdays, job, previous
+
+vars.ann.comb <- attr(terms(reg.step), "term.labels") 
+vars.ann.comb <- c(vars.ann.comb, "age", "pdays", "job", "previous") 
+vars.ann.comb
+
+## Standardization: numeric inputs ## 
+ScaleParams.comb <- preProcess(data.ann.comb[split, vars.ann.comb], method=c("center", "scale"))
+data.ann.comb <- data.ann.comb %>% predict(ScaleParams.comb, .)
+
+
+## Dummy Encoding: nominal inputs ##
+dummy.comb <- dummyVars( ~ . , data = data.ann.comb[split, c(vars.ann.comb, "is_subscription")], fullRank = TRUE)
+data.ann.encode.comb <- data.ann.comb %>% predict(dummy.comb, .)
+ncol(data.ann.encode.comb)
+
+## Prepare train/validation sets as matrices ##
+x.train.comb <- data.ann.encode.comb[split, -ncol(data.ann.encode.comb)] 
+y.train.comb <- data.ann.encode.comb[split,"is_subscription.1"]
+x.valid.comb <- data.ann.encode.comb[!split, -ncol(data.ann.encode.comb)] 
+y.valid.comb <- data.ann.encode.comb[!split,"is_subscription.1"]
+```
+
+### ANN Building ###
+```{r}
+set_random_seed(1234)
+ann.comb <- keras_model_sequential() %>% 
+  layer_dense(units = 6, activation = "tanh", input_shape = c(43)) %>%  # update input shape
+  layer_dense(units = 1, activation = "sigmoid")
+
+ann.comb %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = "adam",
+  metrics = "accuracy"
+)
+
+callbacks.list = list(
+  callback_early_stopping(
+    monitor = "val_loss", # change
+    patience = 5
+  ),
+  callback_model_checkpoint(
+    filepath="my_ann_raw.h5.comb",
+    monitor = "val_loss",  # change
+    save_best_only = TRUE
+  )
+)
+
+history <- ann.comb %>% fit(
+  x= x.train.comb,
+  y= y.train.comb,
+  epochs = 40,
+  validation_data = list(x.valid.comb, y.valid.comb),
+  verbose = 1,
+  callbacks = callbacks.list)
+
+ann.select.comb <- load_model_hdf5("my_ann_raw.h5.comb") 
+
+## Prediction 
+ann.prob.comb <- ann.select.comb %>% predict(x.valid.comb) 
+
+## Use alternative cutoff
+rocCurve.ann.comb <- roc(data.final$is_subscription[!split], as.vector(ann.prob.comb), quiet=TRUE)
+annThresh.comb <-  coords(rocCurve.ann.comb, x = "best", best.method = "closest.topleft")
+ann.class.comb <- as.factor(ifelse(ann.prob.comb >= annThresh.comb$threshold, 1, 0))
+ann.fscore.comb <- confusionMatrix(ann.class.comb, data.final$is_subscription[!split],
+                            positive = "1")$byClass["F1"]
+
+ann.fscore.comb  ## 0.563234
+
+confusionMatrix(ann.class.comb, data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+```
+
+### Random Forest ###
+```{r}
+data.rf <- data.imp
+
+minor <- unname(summary(data.rf$is_subscription[split])[2])
+
+library(randomForest)
+set.seed(1234)
+RF <- randomForest(is_subscription ~., data=data.rf[split,],
+                   ntree = 500, 
+                   strata= data.rf$is_subscription[split], 
+                   sampsize=c(minor,minor),
+                   importance =TRUE)
+print(RF)
+plot(RF)  
+
+# Make predictions #
+library(caret)
+RF.class<- predict(RF, newdata=data.rf[!split,], type="response")
+fscore<-confusionMatrix(RF.class, data.rf$is_subscription[!split],
+                        positive = "1")$byClass["F1"]  
+fscore # 0.5801775
+
+confusionMatrix(RF.class, data.rf$is_subscription[!split],
+                        positive = "1", mode = "everything") 
+# Variable importance #
+RF$importance
+varImpPlot(RF)  
+```
+
+### heatmap of random forest on imbalanced data ###
+
+```{r}
+# The code provided generates a visual representation of the confusion matrix using a heatmap with proportional fill and alpha values.
+library(caret)
+
+# Creating a data frame with the confusion matrix table
+table.RF <- data.frame(confusionMatrix(RF.class, data.rf$is_subscription[!split],
+                        positive = "1", mode = "everything")$table)
+
+# Creating a plotTable with additional columns for 'goodbad' and 'prop'
+plotTable.RF <- table.RF %>%
+  mutate(goodbad = ifelse(table.RF$Prediction == table.RF$Reference, "good", "bad")) %>%
+  group_by(Reference) %>%
+  mutate(prop = Freq/sum(Freq))
+
+# Generating the heatmap plot
+ggplot(data = plotTable.RF, mapping = aes(x = Reference, y = Prediction, fill = goodbad, alpha = prop)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = .5, fontface  = "bold", alpha = 1,size = 30) +
+  scale_fill_manual(values = c(good = "forestgreen", bad = "firebrick1")) +
+  theme_bw() +
+  xlim(rev(levels(table.RF$Reference))) +
+  theme(text = element_text(size=30)) +
+  xlab("True Value")
+
+```
+### model comparison based on imbalanced dataset
+
+```{r}
+##  Area Under Curve
+# DT
+DT.imbalance.prob <- predict(tree.final, data.final[!split,], type="prob")[,2]
+rocCurve.DT.imbalance <- roc(data.final$is_subscription[!split], DT.imbalance.prob, levels = levels(data.final$is_subscription[!split]))  
+# reg.bwd
+reg.bwd.imbalance.prob <- predict(reg.bwd, data.mdl[!split,], type="response")
+rocCurve.reg.bwd.imbalance <- roc(data.final$is_subscription[!split], reg.bwd.imbalance.prob, levels = levels(data.final$is_subscription[!split])) 
+# ANN
+ann.imbalance.prob <- as.vector(ann.select.lr %>% predict(x.valid.lr))
+rocCurve.ann.imbalance <- roc(data.final$is_subscription[!split], ann.imbalance.prob, levels = levels(data.final$is_subscription[!split])) 
+# RF
+RF.imbalance.prob <- predict(RF, data.rf[!split,], type="prob")[,2]
+rocCurve.RF.imbalance <- roc(data.rf$is_subscription[!split], RF.imbalance.prob, levels = levels(data.rf$is_subscription[!split]))
+
+## Compare Area Under Curve
+c(auc(rocCurve.DT.imbalance), auc(rocCurve.reg.bwd.imbalance), auc(rocCurve.ann.imbalance), auc(rocCurve.RF.imbalance))
+
+
+## Plot ROC Curves
+plot(rocCurve.DT.imbalance, legacy.axes = TRUE, col= 'blue')
+plot.roc(rocCurve.reg.bwd.imbalance, add=TRUE, legacy.axes = TRUE, col= 'red')
+plot.roc(rocCurve.ann.imbalance, add=TRUE, legacy.axes = TRUE, col= 'green')
+plot.roc(rocCurve.RF.imbalance, add=TRUE, legacy.axes = TRUE, col= 'purple')
+legend('topleft', legend=c('valid.DT.imbalance', 'valid.reg.bwd.imbalance', 'valid.ann.imbalance', 'valid.RF.imbalance'), 
+       col=c("blue","red","green","purple"),lty=c(1,1,1,1))
+
+```
+
+### Balancing the dataset after transformation and imputaion 
+
+```{r}
+set.seed(1234)
+data.imp[split,] %>%
+  group_by(is_subscription) %>%
+  summarise(count = n()) # 0(no): 19961, 1(yes): 2644
+
+data.balance <- data.imp[split,]
+
+## over sampling 
+data.balance.over <- ovun.sample(is_subscription ~ ., data=data.balance, method = "over", N=39922, seed=1234)$data
+
+data.balance.over %>%
+  group_by(is_subscription) %>%
+  summarise(count = n()) # 0(no): 19961, 1(yes): 19961
+
+## under sampling 
+data.balance.under <- ovun.sample(is_subscription ~ ., data=data.balance, method = "under", N=5288, seed=1234)$data
+
+data.balance.under %>%
+  group_by(is_subscription) %>%
+  summarise(count = n()) # 0(no): 2644, 1(yes): 2644
+
+## both way sampling 
+data.balance.both <- ovun.sample(is_subscription ~ ., data=data.balance, method = "both", p=0.5, N=22600, seed=1234)$data
+
+data.balance.both %>%
+  group_by(is_subscription) %>%
+  summarise(count = n()) # 0(no): 11195, 1(yes): 11405
+
+## rose sampling
+data.balance.rose <- ROSE(is_subscription ~ ., data = data.balance, seed = 1234)$data
+
+data.balance.rose %>%
+  group_by(is_subscription) %>%
+  summarise(count = n()) # 0(no): 11197, 1(yes): 11408
+
+```
+
+### Random Forest based on balanced data 
+
+## over sampling 
+
+```{r}
+library(randomForest)
+set.seed(1234)
+## oversampling 
+RF.over <- randomForest(is_subscription ~., data=data.balance.over,
+                   ntree = 500, 
+                   strata= data.balance.over$is_subscription, 
+                   sampsize=c(19961,19961),
+                   importance =TRUE)
+
+# Make predictions #
+library(caret)
+RF.class.over <- predict(RF.over, newdata=data.rf[!split,], type="response")
+fscore <- confusionMatrix(RF.class.over, data.rf$is_subscription[!split], positive = "1")$byClass["F1"]  
+fscore # 0.6041015
+
+confusionMatrix(RF.class.over, data.rf$is_subscription[!split],
+                        positive = "1", mode = "everything") 
+
+```
+
+## heatmap of random forest on over sampling 
+
+```{r}
+# Creating a data frame with the confusion matrix table
+
+table.RF.over <- data.frame(confusionMatrix(RF.class.over, data.rf$is_subscription[!split],
+                        positive = "1", mode = "everything")$table)
+
+# Creating a plotTable with additional columns for 'goodbad' and 'prop'
+plotTable.RF.over <- table.RF.over %>%
+  mutate(goodbad = ifelse(table.RF.over$Prediction == table.RF.over$Reference, "good", "bad")) %>%
+  group_by(Reference) %>%
+  mutate(prop = Freq/sum(Freq))
+
+# Generating the heatmap plot
+ggplot(data = plotTable.RF.over, mapping = aes(x = Reference, y = Prediction, fill = goodbad, alpha = prop)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = .5, fontface  = "bold", alpha = 1,size = 30) +
+  scale_fill_manual(values = c(good = "forestgreen", bad = "firebrick1")) +
+  theme_bw() +
+  xlim(rev(levels(table.RF.over$Reference))) +
+  theme(text = element_text(size=30)) +
+  xlab("True Value")
+
+```
+
+## under sampling 
+```{r}
+set.seed(1234)
+RF.under <- randomForest(is_subscription ~., data=data.balance.under,
+                   ntree = 500, 
+                   strata= data.balance.under$is_subscription, 
+                   sampsize=c(2644,2644),
+                   importance =TRUE)
+
+# Make predictions #
+library(caret)
+RF.class.under <- predict(RF.under, newdata=data.rf[!split,], type="response")
+fscore <- confusionMatrix(RF.class.under, data.rf$is_subscription[!split], positive = "1")$byClass["F1"]  
+fscore # 0.5441608 
+
+confusionMatrix(RF.class.under, data.rf$is_subscription[!split],
+                        positive = "1", mode = "everything") 
+```
+
+## heatmap of random forest on under sampling 
+
+```{r}
+# Creating a data frame with the confusion matrix table
+table.RF.under <- data.frame(confusionMatrix(RF.class.under, data.rf$is_subscription[!split],
+                        positive = "1", mode = "everything")$table)
+
+# Creating a plotTable with additional columns for 'goodbad' and 'prop'
+plotTable.RF.under <- table.RF.under %>%
+  mutate(goodbad = ifelse(table.RF.under$Prediction == table.RF.under$Reference, "good", "bad")) %>%
+  group_by(Reference) %>%
+  mutate(prop = Freq/sum(Freq))
+
+# Generating the heatmap plot
+ggplot(data = plotTable.RF.under, mapping = aes(x = Reference, y = Prediction, fill = goodbad, alpha = prop)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = .5, fontface  = "bold", alpha = 1,size = 30) +
+  scale_fill_manual(values = c(good = "forestgreen", bad = "firebrick1")) +
+  theme_bw() +
+  xlim(rev(levels(table.RF.under$Reference))) +
+  theme(text = element_text(size=30)) +
+  xlab("True Value")
+
+```
+
+## both way sampling 
+
+```{r}
+set.seed(1234)
+RF.both <- randomForest(is_subscription ~., data=data.balance.both,
+                   ntree = 500, 
+                   strata= data.balance.both$is_subscription, 
+                   sampsize=c(11195,11405),
+                   importance =TRUE)
+
+# Make predictions #
+library(caret)
+RF.class.both <- predict(RF.both, newdata=data.rf[!split,], type="response")
+fscore <- confusionMatrix(RF.class.both, data.rf$is_subscription[!split], positive = "1")$byClass["F1"]  
+fscore # 0.6055305 
+
+confusionMatrix(RF.class.both, data.rf$is_subscription[!split],
+                        positive = "1", mode = "everything") 
+```
+
+## heatmap of random forest on both way sampling 
+
+```{r}
+# Creating a data frame with the confusion matrix table
+table.RF.both <- data.frame(confusionMatrix(RF.class.both, data.rf$is_subscription[!split],
+                        positive = "1", mode = "everything")$table)
+
+# Creating a plotTable with additional columns for 'goodbad' and 'prop'
+plotTable.RF.both <- table.RF.both %>%
+  mutate(goodbad = ifelse(table.RF.both$Prediction == table.RF.both$Reference, "good", "bad")) %>%
+  group_by(Reference) %>%
+  mutate(prop = Freq/sum(Freq))
+
+# Generating the heatmap plot
+ggplot(data = plotTable.RF.both, mapping = aes(x = Reference, y = Prediction, fill = goodbad, alpha = prop)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = .5, fontface  = "bold", alpha = 1,size = 30) +
+  scale_fill_manual(values = c(good = "forestgreen", bad = "firebrick1")) +
+  theme_bw() +
+  xlim(rev(levels(table.RF.both$Reference))) +
+  theme(text = element_text(size=30)) +
+  xlab("True Value")
+
+```
+
+
+## rose sampling 
+```{r}
+set.seed(1234)
+RF.rose <- randomForest(is_subscription ~., data=data.balance.rose,
+                   ntree = 500, 
+                   strata= data.balance.rose$is_subscription, 
+                   sampsize=c(11197,11408),
+                   importance =TRUE)
+
+# Make predictions #
+library(caret)
+RF.class.rose <- predict(RF.rose, newdata=data.rf[!split,], type="response")
+fscore <- confusionMatrix(RF.class.rose, data.rf$is_subscription[!split], positive = "1")$byClass["F1"]  
+fscore # 0.5921088 
+
+confusionMatrix(RF.class.rose, data.rf$is_subscription[!split],
+                        positive = "1", mode = "everything") 
+```
+
+## heatmap of random forest on rose sampling 
+
+```{r}
+# Creating a data frame with the confusion matrix table
+table.RF.rose <- data.frame(confusionMatrix(RF.class.rose, data.rf$is_subscription[!split],
+                        positive = "1", mode = "everything")$table)
+
+# Creating a plotTable with additional columns for 'goodbad' and 'prop'
+plotTable.RF.rose <- table.RF.rose %>%
+  mutate(goodbad = ifelse(table.RF.rose$Prediction == table.RF.rose$Reference, "good", "bad")) %>%
+  group_by(Reference) %>%
+  mutate(prop = Freq/sum(Freq))
+
+# Generating the heatmap plot
+ggplot(data = plotTable.RF.rose, mapping = aes(x = Reference, y = Prediction, fill = goodbad, alpha = prop)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = .5, fontface  = "bold", alpha = 1,size = 30) +
+  scale_fill_manual(values = c(good = "forestgreen", bad = "firebrick1")) +
+  theme_bw() +
+  xlim(rev(levels(table.RF.rose$Reference))) +
+  theme(text = element_text(size=30)) +
+  xlab("True Value")
+
+```
+
+### ROC curves ###
+
+```{r}
+RF.imbalance.prob <- predict(RF, data.rf[!split,], type="prob")[,2]
+rocCurve.RF.imbalance <- roc(data.rf$is_subscription[!split], RF.imbalance.prob, levels = levels(data.rf$is_subscription[!split]))  
+
+RF.over.prob <- predict(RF.over, data.rf[!split,], type="prob")[,2]
+rocCurve.RF.over <- roc(data.rf$is_subscription[!split], RF.over.prob, levels = levels(data.rf$is_subscription[!split]))  
+
+RF.under.prob <- predict(RF.under, data.rf[!split,], type="prob")[,2]
+rocCurve.RF.under <- roc(data.rf$is_subscription[!split], RF.under.prob, levels = levels(data.rf$is_subscription[!split]))  
+
+RF.both.prob <- predict(RF.both, data.rf[!split,], type="prob")[,2]
+rocCurve.RF.both <- roc(data.rf$is_subscription[!split], RF.both.prob, levels = levels(data.rf$is_subscription[!split]))  
+
+RF.rose.prob <- predict(RF.rose, data.rf[!split,], type="prob")[,2]
+rocCurve.RF.rose <- roc(data.rf$is_subscription[!split], RF.rose.prob, levels = levels(data.rf$is_subscription[!split]))  
+
+## Compare Area Under Curve
+c(auc(rocCurve.RF.imbalance), auc(rocCurve.RF.over), auc(rocCurve.RF.under), auc(rocCurve.RF.both), auc(rocCurve.RF.rose))
+
+
+## Plot ROC Curves
+plot(rocCurve.RF.imbalance, legacy.axes = TRUE, col= 'blue')
+plot.roc(rocCurve.RF.over, add=TRUE, legacy.axes = TRUE, col= 'red')
+plot.roc(rocCurve.RF.under, add=TRUE, legacy.axes = TRUE, col= 'green')
+plot.roc(rocCurve.RF.both, add=TRUE, legacy.axes = TRUE, col= 'purple')
+plot.roc(rocCurve.RF.rose, add=TRUE, legacy.axes = TRUE, col= 'orange')
+legend('topleft', legend=c('valid.RF.imbalance', 'valid.RF.over', 'valid.RF.under','valid.RF.both','valid.RF.rose'), 
+       col=c("blue","red","green","purple","orange"),lty=c(1,1,1,1,1))
+
+```
+### Regression modeling based on balanced datasets
+
+## over sampling
+```{r}
+data.reg.over <- data.balance.over 
+levels(data.reg.over$is_subscription) ## check primary outcome; glm function uses 2nd factor level as primary
+
+## Build full model
+full.over <- glm(is_subscription ~ ., family=binomial, data=data.reg.over)
+
+## Set up null model
+null.over <- glm(is_subscription ~ 1, family=binomial, data=data.reg.over)
+n.over <- 39922
+
+reg.step.over <- step(null.over, scope=formula(full.over), direction="both", k=log(n))
+
+summary(reg.step.over) 
+
+reg.step.prob.over <- predict(reg.step.over, data.mdl[!split,], type="response")
+
+## Use alternative cutoff
+rocCurve.reg.over <- roc(data.final$is_subscription[!split], reg.step.prob.over, quiet = TRUE)
+regThresh.over <-  coords(rocCurve.reg.over, x = "best", best.method = "closest.topleft")
+reg.class.over <- as.factor(ifelse(reg.step.prob.over >= regThresh.over$threshold, 1,0))
+reg.step.fscore.over <-confusionMatrix(reg.class.over, data.final$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+
+reg.step.fscore.over ## 0.5405665 
+
+confusionMatrix(reg.class.over,data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+
+
+```
+
+## under sampling
+```{r}
+data.reg.under <- data.balance.under 
+levels(data.reg.under$is_subscription) ## check primary outcome; glm function uses 2nd factor level as primary
+
+## Build full model
+full.under <- glm(is_subscription ~ ., family=binomial, data=data.reg.under)
+
+## Set up null model
+null.under <- glm(is_subscription ~ 1, family=binomial, data=data.reg.under)
+n.under <- 5288
+
+reg.step.under <- step(null.under, scope=formula(full.under), direction="both", k=log(n))
+
+summary(reg.step.under) ## duration, poutcome, month, contact.NA, housing, campaign, day, loan, marital, education, balance
+
+reg.step.prob.under <- predict(reg.step.under, data.mdl[!split,], type="response")
+
+## Use alternative cutoff
+rocCurve.reg.under <- roc(data.final$is_subscription[!split], reg.step.prob.under, quiet = TRUE)
+regThresh.under <-  coords(rocCurve.reg.under, x = "best", best.method = "closest.topleft")
+reg.class.under <- as.factor(ifelse(reg.step.prob.under >= regThresh.under$threshold, 1,0))
+reg.step.fscore.under <-confusionMatrix(reg.class.under, data.final$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+
+reg.step.fscore.under ## 0.536609 
+
+confusionMatrix(reg.class.under,data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+
+
+```
+
+## both way sampling
+```{r}
+data.reg.both <- data.balance.both 
+levels(data.reg.both$is_subscription) ## check primary outcome; glm function uses 2nd factor level as primary
+
+## Build full model
+full.both <- glm(is_subscription ~ ., family=binomial, data=data.reg.both)
+
+## Set up null model
+null.both <- glm(is_subscription ~ 1, family=binomial, data=data.reg.both)
+n.both <- 22600
+
+reg.step.both <- step(null.both, scope=formula(full.both), direction="both", k=log(n))
+
+summary(reg.step.both) ## duration, poutcome, month, contact.NA, housing, campaign, day, loan, marital, education, balance
+
+reg.step.prob.both <- predict(reg.step.both, data.mdl[!split,], type="response")
+
+## Use alternative cutoff
+rocCurve.reg.both <- roc(data.final$is_subscription[!split], reg.step.prob.both, quiet = TRUE)
+regThresh.both <-  coords(rocCurve.reg.both, x = "best", best.method = "closest.topleft")
+reg.class.both <- as.factor(ifelse(reg.step.prob.both >= regThresh.both$threshold, 1,0))
+reg.step.fscore.both <-confusionMatrix(reg.class.both, data.final$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+
+reg.step.fscore.both ## 0.5323406 
+
+confusionMatrix(reg.class.both,data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+
+
+```
+
+## rose sampling
+```{r}
+data.reg.rose <- data.balance.rose 
+levels(data.reg.rose$is_subscription) ## check primary outcome; glm function uses 2nd factor level as primary
+
+## Build full model
+full.rose <- glm(is_subscription ~ ., family=binomial, data=data.reg.rose)
+
+## Set up null model
+null.rose <- glm(is_subscription ~ 1, family=binomial, data=data.reg.rose)
+n.rose <- 22605
+
+reg.step.rose <- step(null.rose, scope=formula(full.rose), direction="both", k=log(n))
+
+summary(reg.step.rose) ## duration, poutcome, month, contact.NA, housing, campaign, day, loan, marital, education, balance
+
+reg.step.prob.rose <- predict(reg.step.rose, data.mdl[!split,], type="response")
+
+## Use alternative cutoff
+rocCurve.reg.rose <- roc(data.final$is_subscription[!split], reg.step.prob.rose, quiet = TRUE)
+regThresh.rose <-  coords(rocCurve.reg.both, x = "best", best.method = "closest.topleft")
+reg.class.rose <- as.factor(ifelse(reg.step.prob.rose >= regThresh.rose$threshold, 1,0))
+reg.step.fscore.rose <-confusionMatrix(reg.class.rose, data.final$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+
+reg.step.fscore.rose ## 0.5306
+
+confusionMatrix(reg.class.rose,data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+
+
+```
+
+### ROC curves ###
+
+```{r}
+# reg.imbalance
+reg.imbalance.prob <- predict(reg.bwd, data.mdl[!split,], type="response")
+rocCurve.reg.imbalance <- roc(data.final$is_subscription[!split], reg.imbalance.prob, levels = levels(data.final$is_subscription[!split])) 
+#reg.over
+reg.over.prob <- predict(reg.step.over, data.mdl[!split,], type="response")
+rocCurve.reg.over <- roc(data.final$is_subscription[!split], reg.over.prob, levels = levels(data.final$is_subscription[!split])) 
+#reg.under
+reg.under.prob <- predict(reg.step.under, data.mdl[!split,], type="response")
+rocCurve.reg.under <- roc(data.final$is_subscription[!split], reg.under.prob, levels = levels(data.final$is_subscription[!split])) 
+#reg.both
+reg.both.prob <- predict(reg.step.both, data.mdl[!split,], type="response")
+rocCurve.reg.both <- roc(data.final$is_subscription[!split], reg.both.prob, levels = levels(data.final$is_subscription[!split]))
+#reg.rose
+reg.rose.prob <- predict(reg.step.rose, data.mdl[!split,], type="response")
+rocCurve.reg.rose <- roc(data.final$is_subscription[!split], reg.rose.prob, levels = levels(data.final$is_subscription[!split]))
+
+## Compare Area Under Curve
+c(auc(rocCurve.reg.imbalance), auc(rocCurve.reg.over), auc(rocCurve.reg.under), auc(rocCurve.reg.both), auc(rocCurve.reg.rose))
+
+## Plot ROC Curves
+plot(rocCurve.reg.imbalance, legacy.axes = TRUE, col= 'blue')
+plot.roc(rocCurve.reg.over, add=TRUE, legacy.axes = TRUE, col= 'red')
+plot.roc(rocCurve.reg.under, add=TRUE, legacy.axes = TRUE, col= 'green')
+plot.roc(rocCurve.reg.both, add=TRUE, legacy.axes = TRUE, col= 'purple')
+plot.roc(rocCurve.reg.rose, add=TRUE, legacy.axes = TRUE, col= 'orange')
+legend('topleft', legend=c('valid.reg.imbalance', 'valid.reg.over', 'valid.reg.under','valid.reg.both','valid.reg.rose'), 
+       col=c("blue","red","green","purple","orange"),lty=c(1,1,1,1,1))
+
+```
+
+
+### ANN modeling based on balanced datasets using logistic regression
+
+## over sampling
+```{r}
+data.ann.over <- rbind(data.balance.over, data.imp[!split,])
+
+vars.ann.lr
+
+## Standardization: numeric inputs ## 
+ScaleParams.over <- preProcess(data.ann.over[, vars.ann.lr], method=c("center", "scale"))
+data.ann.over <- data.ann.over %>% predict(ScaleParams.over, .)
+
+
+## Dummy Encoding: nominal inputs ##
+dummy.over <- dummyVars( ~ . , data = data.ann.over[, c(vars.ann.lr, "is_subscription")], fullRank = TRUE)
+data.ann.encode.over <- data.ann.over %>% predict(dummy.over, .)
+ncol(data.ann.encode.over)
+
+## Prepare train/validation sets as matrices ##
+x.train.over <- data.ann.encode.over[c(1:39922), -ncol(data.ann.encode.over)] 
+y.train.over <- data.ann.encode.over[c(1:39922),"is_subscription.1"]
+x.valid.over <- data.ann.encode.over[c(39923:62528), -ncol(data.ann.encode.over)] 
+y.valid.over <- data.ann.encode.over[c(39923:62528),"is_subscription.1"]
+
+set_random_seed(1234)
+ann.over <- keras_model_sequential() %>% 
+  layer_dense(units = 6, activation = "tanh", input_shape = c(29)) %>%  
+  layer_dense(units = 1, activation = "sigmoid")
+
+ann.over %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = "adam",
+  metrics = "accuracy"
+)
+
+callbacks.list = list(
+  callback_early_stopping(
+    monitor = "val_loss", # change
+    patience = 5
+  ),
+  callback_model_checkpoint(
+    filepath="my_ann_raw.h5.over",
+    monitor = "val_loss",  # change
+    save_best_only = TRUE
+  )
+)
+
+history <- ann.over %>% fit(
+  x= x.train.over,
+  y= y.train.over,
+  epochs = 40,
+  validation_data = list(x.valid.over, y.valid.over),
+  verbose = 1,
+  callbacks = callbacks.list)
+
+ann.select.over <-load_model_hdf5("my_ann_raw.h5.over") 
+
+## Prediction 
+ann.prob.over <- ann.select.over %>% predict(x.valid.over) 
+
+## Use alternative cutoff
+rocCurve.ann.over <- roc(data.final$is_subscription[!split], as.vector(ann.prob.over), quiet=TRUE)
+annThresh.over <-  coords(rocCurve.ann.over, x = "best", best.method = "closest.topleft")
+ann.class.over <- as.factor(ifelse(ann.prob.over >= annThresh.over$threshold, 1, 0))
+ann.fscore.over <- confusionMatrix(ann.class.over, data.final$is_subscription[!split],
+                            positive = "1")$byClass["F1"]
+
+ann.fscore.over  ## 0.5667412 
+
+confusionMatrix(ann.class.over, data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+
+```
+
+## under sampling
+
+```{r}
+data.ann.under <- rbind(data.balance.under, data.imp[!split,])
+
+## Standardization: numeric inputs ## 
+ScaleParams.under <- preProcess(data.ann.under[, vars.ann.lr], method=c("center", "scale"))
+data.ann.under <- data.ann.under %>% predict(ScaleParams.under, .)
+
+
+## Dummy Encoding: nominal inputs ##
+dummy.under <- dummyVars( ~ . , data = data.ann.under[, c(vars.ann.lr, "is_subscription")], fullRank = TRUE)
+data.ann.encode.under <- data.ann.under %>% predict(dummy.under, .)
+ncol(data.ann.encode.under)
+
+## Prepare train/validation sets as matrices ##
+x.train.under <- data.ann.encode.under[c(1:5288), -ncol(data.ann.encode.under)] 
+y.train.under <- data.ann.encode.under[c(1:5288),"is_subscription.1"]
+x.valid.under <- data.ann.encode.under[c(5289:27894), -ncol(data.ann.encode.under)] 
+y.valid.under <- data.ann.encode.under[c(5289:27894),"is_subscription.1"]
+
+set_random_seed(1234)
+ann.under <- keras_model_sequential() %>% 
+  layer_dense(units = 6, activation = "tanh", input_shape = c(29)) %>%  
+  layer_dense(units = 1, activation = "sigmoid")
+
+ann.under %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = "adam",
+  metrics = "accuracy"
+)
+
+callbacks.list = list(
+  callback_early_stopping(
+    monitor = "val_loss", # change
+    patience = 5
+  ),
+  callback_model_checkpoint(
+    filepath="my_ann_raw.h5.under",
+    monitor = "val_loss",  # change
+    save_best_only = TRUE
+  )
+)
+
+history <- ann.under %>% fit(
+  x= x.train.under,
+  y= y.train.under,
+  epochs = 40,
+  validation_data = list(x.valid.under, y.valid.under),
+  verbose = 1,
+  callbacks = callbacks.list)
+
+ann.select.under <-load_model_hdf5("my_ann_raw.h5.under") 
+
+## Prediction 
+ann.prob.under <- ann.select.under %>% predict(x.valid.under) 
+
+## Use alternative cutoff
+rocCurve.ann.under <- roc(data.final$is_subscription[!split], as.vector(ann.prob.under), quiet=TRUE)
+annThresh.under <-  coords(rocCurve.ann.under, x = "best", best.method = "closest.topleft")
+ann.class.under <- as.factor(ifelse(ann.prob.under >= annThresh.under$threshold, 1, 0))
+ann.fscore.under <- confusionMatrix(ann.class.under, data.final$is_subscription[!split],
+                            positive = "1")$byClass["F1"]
+
+ann.fscore.under  ## 0.5209302 
+
+confusionMatrix(ann.class.under, data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+
+```
+
+
+## both sampling
+
+```{r}
+
+data.ann.both <- rbind(data.balance.both, data.imp[!split,])
+
+## Standardization: numeric inputs ## 
+ScaleParams.both <- preProcess(data.ann.both[, vars.ann.lr], method=c("center", "scale"))
+data.ann.both <- data.ann.both %>% predict(ScaleParams.both, .)
+
+
+## Dummy Encoding: nominal inputs ##
+dummy.both <- dummyVars( ~ . , data = data.ann.both[, c(vars.ann.lr, "is_subscription")], fullRank = TRUE)
+data.ann.encode.both <- data.ann.both %>% predict(dummy.both, .)
+ncol(data.ann.encode.both)
+
+## Prepare train/validation sets as matrices ##
+x.train.both <- data.ann.encode.both[c(1:22600), -ncol(data.ann.encode.both)] 
+y.train.both <- data.ann.encode.both[c(1:22600),"is_subscription.1"]
+x.valid.both <- data.ann.encode.both[c(22601:45206), -ncol(data.ann.encode.both)] 
+y.valid.both <- data.ann.encode.both[c(22601:45206),"is_subscription.1"]
+
+set_random_seed(1234)
+ann.both <- keras_model_sequential() %>% 
+  layer_dense(units = 6, activation = "tanh", input_shape = c(29)) %>%  
+  layer_dense(units = 1, activation = "sigmoid")
+
+ann.both %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = "adam",
+  metrics = "accuracy"
+)
+
+callbacks.list = list(
+  callback_early_stopping(
+    monitor = "val_loss", # change
+    patience = 5
+  ),
+  callback_model_checkpoint(
+    filepath="my_ann_raw.h5.both",
+    monitor = "val_loss",  # change
+    save_best_only = TRUE
+  )
+)
+
+history <- ann.both %>% fit(
+  x= x.train.both,
+  y= y.train.both,
+  epochs = 40,
+  validation_data = list(x.valid.both, y.valid.both),
+  verbose = 1,
+  callbacks = callbacks.list)
+
+ann.select.both <-load_model_hdf5("my_ann_raw.h5.both") 
+
+## Prediction 
+ann.prob.both <- ann.select.both %>% predict(x.valid.both) 
+
+## Use alternative cutoff
+rocCurve.ann.both <- roc(data.final$is_subscription[!split], as.vector(ann.prob.both), quiet=TRUE)
+annThresh.both <-  coords(rocCurve.ann.both, x = "best", best.method = "closest.topleft")
+ann.class.both <- as.factor(ifelse(ann.prob.both >= annThresh.both$threshold, 1, 0))
+ann.fscore.both <- confusionMatrix(ann.class.both, data.final$is_subscription[!split],
+                            positive = "1")$byClass["F1"]
+
+ann.fscore.both  ## 0.5473916 
+
+confusionMatrix(ann.class.both, data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+
+```
+
+
+## rose sampling
+
+```{r}
+
+data.ann.rose <- rbind(data.balance.rose, data.imp[!split,])
+
+## Standardization: numeric inputs ## 
+ScaleParams.rose <- preProcess(data.ann.rose[, vars.ann.lr], method=c("center", "scale"))
+data.ann.rose <- data.ann.rose %>% predict(ScaleParams.rose, .)
+
+
+## Dummy Encoding: nominal inputs ##
+dummy.rose <- dummyVars( ~ . , data = data.ann.rose[, c(vars.ann.lr, "is_subscription")], fullRank = TRUE)
+data.ann.encode.rose <- data.ann.rose %>% predict(dummy.rose, .)
+ncol(data.ann.encode.rose)
+
+## Prepare train/validation sets as matrices ##
+x.train.rose <- data.ann.encode.rose[c(1:22605), -ncol(data.ann.encode.rose)] 
+y.train.rose <- data.ann.encode.rose[c(1:22605),"is_subscription.1"]
+x.valid.rose <- data.ann.encode.rose[c(22606:45211), -ncol(data.ann.encode.rose)] 
+y.valid.rose <- data.ann.encode.rose[c(22606:45211),"is_subscription.1"]
+
+set_random_seed(1234)
+ann.rose <- keras_model_sequential() %>% 
+  layer_dense(units = 6, activation = "tanh", input_shape = c(29)) %>%  
+  layer_dense(units = 1, activation = "sigmoid")
+
+ann.rose %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = "adam",
+  metrics = "accuracy"
+)
+
+callbacks.list = list(
+  callback_early_stopping(
+    monitor = "val_loss", # change
+    patience = 5
+  ),
+  callback_model_checkpoint(
+    filepath="my_ann_raw.h5.rose",
+    monitor = "val_loss",  # change
+    save_best_only = TRUE
+  )
+)
+
+history <- ann.rose %>% fit(
+  x= x.train.rose,
+  y= y.train.rose,
+  epochs = 40,
+  validation_data = list(x.valid.rose, y.valid.rose),
+  verbose = 1,
+  callbacks = callbacks.list)
+
+ann.select.rose <-load_model_hdf5("my_ann_raw.h5.rose") 
+
+## Prediction 
+ann.prob.rose <- ann.select.rose %>% predict(x.valid.rose) 
+
+## Use alternative cutoff
+rocCurve.ann.rose <- roc(data.final$is_subscription[!split], as.vector(ann.prob.rose), quiet=TRUE)
+annThresh.rose <-  coords(rocCurve.ann.rose, x = "best", best.method = "closest.topleft")
+ann.class.rose <- as.factor(ifelse(ann.prob.rose >= annThresh.rose$threshold, 1, 0))
+ann.fscore.rose <- confusionMatrix(ann.class.rose, data.final$is_subscription[!split],
+                            positive = "1")$byClass["F1"]
+
+ann.fscore.rose  ## 0.5370746 
+
+confusionMatrix(ann.class.rose, data.final$is_subscription[!split],
+                positive = "1", mode= "everything")
+
+```
+
+### ROC curves ###
+```{r}
+# ann.imbalance
+ann.imbalance.prob <- as.vector(ann.select.lr %>% predict(x.valid.lr))
+rocCurve.ann.imbalance <- roc(data.final$is_subscription[!split], ann.imbalance.prob, levels = levels(data.final$is_subscription[!split])) 
+# ann.over
+ann.over.prob <- as.vector(ann.select.over %>% predict(x.valid.over))
+rocCurve.ann.over <- roc(data.final$is_subscription[!split], ann.over.prob, levels = levels(data.final$is_subscription[!split])) 
+# ann.under
+ann.under.prob <- as.vector(ann.select.under %>% predict(x.valid.under))
+rocCurve.ann.under <- roc(data.final$is_subscription[!split], ann.under.prob, levels = levels(data.final$is_subscription[!split])) 
+# ann.both
+ann.both.prob <- as.vector(ann.select.both %>% predict(x.valid.both))
+rocCurve.ann.both <- roc(data.final$is_subscription[!split], ann.both.prob, levels = levels(data.final$is_subscription[!split])) 
+# ann.rose
+ann.rose.prob <- as.vector(ann.select.rose %>% predict(x.valid.rose))
+rocCurve.ann.rose <- roc(data.final$is_subscription[!split], ann.rose.prob, levels = levels(data.final$is_subscription[!split])) 
+
+## Compare Area Under Curve
+c(auc(rocCurve.ann.imbalance), auc(rocCurve.ann.over), auc(rocCurve.ann.under), auc(rocCurve.ann.both), auc(rocCurve.ann.rose))
+
+## Plot ROC Curves
+plot(rocCurve.ann.imbalance, legacy.axes = TRUE, col= 'blue')
+plot.roc(rocCurve.ann.over, add=TRUE, legacy.axes = TRUE, col= 'red')
+plot.roc(rocCurve.ann.under, add=TRUE, legacy.axes = TRUE, col= 'green')
+plot.roc(rocCurve.ann.both, add=TRUE, legacy.axes = TRUE, col= 'purple')
+plot.roc(rocCurve.ann.rose, add=TRUE, legacy.axes = TRUE, col= 'orange')
+legend('topleft', legend=c('valid.ann.imbalance', 'valid.ann.over', 'valid.ann.under','valid.ann.both','valid.ann.rose'), 
+       col=c("blue","red","green","purple","orange"),lty=c(1,1,1,1,1))
+
+```
+
+
+
+### Balancing the dataset without transformation and imputaion 
+
+```{r}
+data.final[split,] %>%
+  group_by(is_subscription) %>%
+  summarise(count = n()) # 0(no): 19961, 1(yes): 2644
+
+data.balance.wo <- data.final[split,]
+
+## over sampling 
+data.balance.wo.over <- ovun.sample(is_subscription ~ ., data=data.balance.wo, method = "over", N=39922, seed = 1234)$data
+
+data.balance.wo.over %>%
+  group_by(is_subscription) %>%
+  summarise(count = n()) # 0(no): 13196, 1(yes): 26726
+
+## under sampling 
+data.balance.wo.under <- ovun.sample(is_subscription ~ ., data=data.balance.wo, method = "under", N=5288,seed = 1234)$data
+
+data.balance.wo.under %>%
+  group_by(is_subscription) %>%
+  summarise(count = n()) # 0(no): 3044, 1(yes): 2244
+
+## both way sampling 
+data.balance.wo.both <- ovun.sample(is_subscription ~ ., data=data.balance.wo, method = "both", p=0.5, N=22600, seed=1234)$data
+
+data.balance.wo.both %>%
+  group_by(is_subscription) %>%
+  summarise(count = n()) # 0(no): 11195, 1(yes): 11405
+
+## rose sampling
+data.balance.wo.rose <- ROSE(is_subscription ~ ., data = data.balance.wo, seed = 1234)$data
+
+data.balance.wo.rose %>%
+  group_by(is_subscription) %>%
+  summarise(count = n()) # 0(no): 7683, 1(yes): 7757
+
+```
+
+### Profit-Driven Decision Tree based on balanced datasets 
+
+## find the new probabilities
+```{r}
+data.new.over <- rbind(data.balance.over, data.imp[!split,])
+prop.over <- 1/prop.table(table(data.new.over$is_subscription)) 
+prop.over
+
+data.new.under <- rbind(data.balance.under, data.imp[!split,])
+prop.under <- 1/prop.table(table(data.new.over$is_subscription)) 
+prop.under
+
+data.new.both <- rbind(data.balance.both, data.imp[!split,])
+prop.both <- 1/prop.table(table(data.new.both$is_subscription)) 
+prop.both
+
+data.new.rose <- rbind(data.balance.rose, data.imp[!split,])
+prop.rose <- 1/prop.table(table(data.new.rose$is_subscription)) 
+prop.rose
+```
+
+## over sampling
+```{r}
+## Define cost matrix
+set.seed(1234)
+costMatrix.over <-matrix(c(0,prop.over[2],prop.over[1],0), nrow=2) 
+costMatrix.over
+
+tree.over <- rpart(formula = is_subscription ~ .,data = data.balance.over,
+              parms=list(loss=costMatrix.over),
+              control=rpart.control(cp=0.001)) 
+summary(tree.over) 
+
+## Model pruning on F-score
+cp.seq=tree.over$cptable[,1]
+fscore<-numeric(0)
+fscore[1]<-0
+for (i in 2:length(cp.seq)) {
+  tree.prob <- predict(prune(tree.over, cp=cp.seq[i]), data.imp[!split,],type="prob")[,2] 
+  rocCurve.tree <- roc(data.imp$is_subscription[!split], tree.prob, quiet=TRUE)
+  treeThresh <- coords(rocCurve.tree, x = "best", best.method = "closest.topleft")
+  tree.class <- as.factor(ifelse(tree.prob >= treeThresh$threshold, 1,0))
+  fscore[i]<- confusionMatrix(tree.class, data.imp$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+}
+
+
+## Maximum F-Score
+max(fscore)  ## 0.5377381
+
+confusionMatrix(tree.class, data.imp$is_subscription[!split],
+               positive = "1", mode= "everything")
+
+```
+
+## under sampling
+```{r}
+set.seed(1234)
+## Define cost matrix
+costMatrix.under <-matrix(c(0,prop.under[2],prop.under[1],0), nrow=2) 
+costMatrix.under
+
+tree.under <- rpart(formula = is_subscription ~ .,data = data.balance.under,
+              parms=list(loss=costMatrix.under),
+              control=rpart.control(cp=0.001)) 
+summary(tree.under) 
+
+## Model pruning on F-score
+cp.seq=tree.under$cptable[,1]
+fscore<-numeric(0)
+fscore[1]<-0
+for (i in 2:length(cp.seq)) {
+  tree.prob <- predict(prune(tree.under, cp=cp.seq[i]), data.imp[!split,],type="prob")[,2] 
+  rocCurve.tree <- roc(data.imp$is_subscription[!split], tree.prob, quiet=TRUE)
+  treeThresh <- coords(rocCurve.tree, x = "best", best.method = "closest.topleft")
+  tree.class <- as.factor(ifelse(tree.prob >= treeThresh$threshold, 1,0))
+  fscore[i]<- confusionMatrix(tree.class, data.imp$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+}
+
+
+## Maximum F-Score
+max(fscore)  ## 0.5281344
+
+confusionMatrix(tree.class, data.imp$is_subscription[!split],
+               positive = "1", mode= "everything")
+
+```
+
+## both sampling
+```{r}
+set.seed(1234)
+## Define cost matrix
+costMatrix.both <-matrix(c(0,prop.both[2],prop.both[1],0), nrow=2) 
+costMatrix.both
+
+tree.both <- rpart(formula = is_subscription ~ .,data = data.balance.both,
+              parms=list(loss=costMatrix.both),
+              control=rpart.control(cp=0.001)) 
+summary(tree.both) 
+
+## Model pruning on F-score
+cp.seq=tree.under$cptable[,1]
+fscore<-numeric(0)
+fscore[1]<-0
+for (i in 2:length(cp.seq)) {
+  tree.prob <- predict(prune(tree.both, cp=cp.seq[i]), data.imp[!split,],type="prob")[,2] 
+  rocCurve.tree <- roc(data.imp$is_subscription[!split], tree.prob, quiet=TRUE)
+  treeThresh <- coords(rocCurve.tree, x = "best", best.method = "closest.topleft")
+  tree.class <- as.factor(ifelse(tree.prob >= treeThresh$threshold, 1,0))
+  fscore[i]<- confusionMatrix(tree.class, data.imp$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+}
+
+
+## Maximum F-Score
+max(fscore)  ## 0.5241065
+
+confusionMatrix(tree.class, data.imp$is_subscription[!split],
+               positive = "1", mode= "everything")
+
+```
+
+## rose sampling
+```{r}
+set.seed(1234)
+## Define cost matrix
+costMatrix.rose <-matrix(c(0,prop.rose[2],prop.rose[1],0), nrow=2) 
+costMatrix.rose
+
+tree.rose <- rpart(formula = is_subscription ~ .,data = data.balance.rose,
+              parms=list(loss=costMatrix.rose),
+              control=rpart.control(cp=0.001)) 
+summary(tree.rose) 
+
+## Model pruning on F-score
+cp.seq=tree.under$cptable[,1]
+fscore<-numeric(0)
+fscore[1]<-0
+for (i in 2:length(cp.seq)) {
+  tree.prob <- predict(prune(tree.rose, cp=cp.seq[i]), data.imp[!split,],type="prob")[,2] 
+  rocCurve.tree <- roc(data.imp$is_subscription[!split], tree.prob, quiet=TRUE)
+  treeThresh <- coords(rocCurve.tree, x = "best", best.method = "closest.topleft")
+  tree.class <- as.factor(ifelse(tree.prob >= treeThresh$threshold, 1,0))
+  fscore[i]<- confusionMatrix(tree.class, data.imp$is_subscription[!split],
+                             positive = "1")$byClass["F1"]
+}
+
+
+## Maximum F-Score
+max(fscore)  ## 0.5325472
+
+confusionMatrix(tree.class, data.imp$is_subscription[!split],
+               positive = "1", mode= "everything")
+
+```
+
+
+```{r}
+# DT.imbalance
+DT.imbalance.prob <- predict(tree.final, data.final[!split,], type="prob")[,2]
+rocCurve.DT.imbalance <- roc(data.final$is_subscription[!split], DT.imbalance.prob, levels = levels(data.final$is_subscription[!split])) 
+# DT.over
+DT.over.prob <- predict(tree.over, data.imp[!split,], type="prob")[,2]
+rocCurve.DT.over <- roc(data.imp$is_subscription[!split], DT.over.prob, levels = levels(data.imp$is_subscription[!split]))
+# DT.under
+DT.under.prob <- predict(tree.under, data.imp[!split,], type="prob")[,2]
+rocCurve.DT.under <- roc(data.imp$is_subscription[!split], DT.under.prob, levels = levels(data.imp$is_subscription[!split]))
+# DT.both
+DT.both.prob <- predict(tree.both, data.imp[!split,], type="prob")[,2]
+rocCurve.DT.both <- roc(data.imp$is_subscription[!split], DT.both.prob, levels = levels(data.imp$is_subscription[!split]))
+# DT.rose
+DT.rose.prob <- predict(tree.rose, data.imp[!split,], type="prob")[,2]
+rocCurve.DT.rose <- roc(data.imp$is_subscription[!split], DT.rose.prob, levels = levels(data.imp$is_subscription[!split]))
+## Compare Area Under Curve
+c(auc(rocCurve.DT.imbalance), auc(rocCurve.DT.over), auc(rocCurve.DT.under), auc(rocCurve.DT.both), auc(rocCurve.DT.rose))
+
+## Plot ROC Curves
+plot(rocCurve.DT.imbalance, legacy.axes = TRUE, col= 'blue')
+plot.roc(rocCurve.DT.over, add=TRUE, legacy.axes = TRUE, col= 'red')
+plot.roc(rocCurve.DT.under, add=TRUE, legacy.axes = TRUE, col= 'green')
+plot.roc(rocCurve.DT.both, add=TRUE, legacy.axes = TRUE, col= 'purple')
+plot.roc(rocCurve.DT.rose, add=TRUE, legacy.axes = TRUE, col= 'orange')
+legend('topleft', legend=c('valid.DT.imbalance', 'valid.DT.over', 'valid.DT.under','valid.DT.both','valid.DT.rose'), 
+       col=c("blue","red","green","purple","orange"),lty=c(1,1,1,1,1))
+
+
+
+```
+
